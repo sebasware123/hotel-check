@@ -1,58 +1,50 @@
 # Hotel Check
 
-Hotel Check es una demo de reservas de propiedades. Puedes buscar alojamientos, elegir fechas y reservar sin crear una cuenta. En el detalle hay una prueba que envía 50 reservas para las mismas fechas y muestra cómo responde la API.
+Hotel Check es una demo de reservas de propiedades con una prueba de concurrencia integrada. En la interfaz se elige una propiedad y un rango de fechas; el panel de ingeniería envía 50 reservas para ese mismo rango y muestra las respuestas y latencias.
 
-La demo y el dashboard de Grafana estarán enlazados aquí cuando termine el despliegue.
+La demo y el dashboard público de métricas se enlazarán aquí cuando estén publicados.
+
+## Arquitectura
+
+```mermaid
+flowchart LR
+    Persona --> Web[Next.js y TypeScript]
+    Web -->|/api/*| API[Go y Gin]
+    API --> DB[(Neon Postgres)]
+    Grafana[Grafana Cloud] -->|GET /metrics| API
+    Web -. sesiones y heatmaps .-> Clarity[Microsoft Clarity]
+```
+
+Next.js sirve la interfaz y reenvía las llamadas `/api/*` a Go. El navegador no se conecta directamente a la base de datos. La API guarda propiedades y reservas en Neon; Grafana lee sus métricas de `/metrics`, y Clarity registra interacciones con la interfaz.
 
 ## La reserva bajo concurrencia
 
-La protección contra dobles reservas está en PostgreSQL. Una restricción `EXCLUDE USING gist` impide que se confirmen dos reservas solapadas para la misma propiedad. La petición ganadora recibe `201 Created`; las que chocan reciben `409 Conflict`.
+Una comprobación de disponibilidad en la aplicación no basta: dos peticiones simultáneas podrían leer las mismas fechas libres y luego guardar dos reservas. Por eso, PostgreSQL aplica una restricción `EXCLUDE USING gist` sobre la propiedad y el rango de fechas. La base de datos acepta una reserva y rechaza las que se solapan; la API devuelve `201 Created` o `409 Conflict`.
 
-El rango cuenta la noche de entrada, pero no la noche de salida (`[check_in, check_out)`). Así, una nueva reserva puede empezar el mismo día en que termina la anterior. Neon incluye la extensión `btree_gist` que necesita esta restricción.
+El rango incluye el check-in y excluye el check-out (`[check_in, check_out)`). Una reserva nueva puede empezar el día en que termina la anterior. La extensión `btree_gist` permite combinar la propiedad con la búsqueda de rangos solapados.
 
-## Probarlo en local
+Si las fechas están libres antes de iniciar la prueba, el resultado esperado es una reserva confirmada y 49 conflictos. El panel también muestra errores de red o del servidor por separado.
 
-Necesitas Go, Node.js y una base de datos en Neon. No hace falta instalar Docker.
+## Tecnologías
 
-1. Copia `.env.example` a `.env` (`Copy-Item .env.example .env` en PowerShell o `cp .env.example .env` en Bash).
-2. En `DATABASE_URL`, pega la cadena de conexión que Neon muestra en **Connect**. Déjala con `sslmode=require`. Cambia `DEMO_RESET_TOKEN` por un secreto propio.
-3. Desde la raíz del proyecto, ejecuta `go mod tidy` y luego `go run .`. La API crea las tablas y carga seis propiedades si la base está vacía. Está disponible en `http://localhost:8080`.
-4. En otra terminal, copia `.env.local.example` a `.env.local`. Conserva `GO_API_URL=http://localhost:8080` y pon el mismo `DEMO_RESET_TOKEN`.
-5. Ejecuta `npm install` y `npm run dev`. Abre `http://localhost:3000`.
+- **Go y Gin:** API HTTP, validación de reservas y transacciones.
+- **PostgreSQL en Neon:** almacenamiento y protección final contra solapamientos.
+- **Next.js App Router, TypeScript y Tailwind CSS:** interfaz de propiedades, calendario y panel de concurrencia.
+- **Prometheus y Grafana Cloud:** conteo de intentos, conflictos y latencia.
+- **Microsoft Clarity:** heatmaps y grabaciones de sesiones de la interfaz.
 
-No subas `.env` ni `.env.local` a Git. Tampoco pongas secretos en variables `NEXT_PUBLIC_*`: esas variables se envían al navegador.
+## Métricas
 
-## Despliegue
+La API expone `booking_attempts_total` con el resultado de cada reserva y `booking_duration_seconds` para medir su duración. El dashboard importable está en [`grafana/hotel-check-concurrency.json`](grafana/hotel-check-concurrency.json); muestra confirmaciones, conflictos, latencia media y p95.
 
-Frontend y API se despliegan como servicios separados desde este repositorio.
+`/api/stats` y las métricas se guardan en memoria y vuelven a cero si se reinicia la API. Por eso, la demo está pensada para ejecutarse con una instancia del backend.
 
-**API en Render**
+## Estructura del código
 
-Conecta el repositorio como un Web Service y usa el `Dockerfile` de la raíz. Render construye la imagen en sus servidores; no necesitas Docker local. Configura `DATABASE_URL` con Neon y `DEMO_RESET_TOKEN` con el mismo secreto que usarás en Vercel. Guarda la URL pública de Render: la necesitarás para conectar el frontend y Grafana.
-
-**Frontend en Vercel**
-
-Importa el mismo repositorio como proyecto Next.js desde la raíz. Configura `GO_API_URL` con la URL de Render, sin barra final. Añade `NEXT_PUBLIC_CLARITY_ID` y, cuando tengas el enlace público, `NEXT_PUBLIC_GRAFANA_DASHBOARD_URL`. Si habilitas el botón para borrar reservas de prueba, configura también `DEMO_RESET_TOKEN` con el mismo valor que en Render.
-
-Next.js reenvía las llamadas `/api/*` a Render. El navegador no accede directamente a Neon y no hace falta configurar CORS para este flujo.
-
-## Métricas en Grafana
-
-La API publica `/metrics` en formato Prometheus. Las métricas propias son `booking_attempts_total` (resultado de cada intento) y `booking_duration_seconds` (duración de las reservas). El dashboard listo para importar está en [`grafana/hotel-check-concurrency.json`](grafana/hotel-check-concurrency.json); muestra reservas confirmadas, conflictos y latencia.
-
-En Grafana Cloud, agrega la URL pública de Render terminada en `/metrics` desde **Connections > Add connection > Metrics Endpoint**. Luego importa el JSON y selecciona la fuente Prometheus. Grafana consulta la API cada 60 segundos. Para dar acceso a reclutadores, guarda el dashboard y usa **Share > Share externally**.
-
-Los contadores de `/api/stats` y Prometheus viven en la memoria de la API y vuelven a cero al reiniciarla. Para esta demo, mantén una sola instancia de backend.
-
-## API
-
-- `GET /api/properties?location=Cartagena&max_price=500000` lista propiedades y acepta filtros opcionales.
-- `GET /api/properties/:id/availability` devuelve los rangos ocupados.
-- `POST /api/bookings` crea una reserva o devuelve `409` si las fechas chocan.
-- `GET /api/stats` devuelve un resumen de las reservas atendidas por esta instancia.
-- `GET /metrics` entrega las métricas para Prometheus.
-- `GET /healthz` sirve para comprobar que la API está activa.
-
-El botón del panel de concurrencia puede borrar las reservas de esa prueba. La limpieza usa `DEMO_RESET_TOKEN` y elimina solo las reservas asociadas a esa corrida.
-
-Las variables necesarias están en [`.env.example`](.env.example) para Go y [`.env.local.example`](.env.local.example) para Next.js.
+- `main.go`: inicia la API y registra las rutas.
+- `db.go`: conecta con Neon, crea las tablas y carga seis propiedades de ejemplo si la tabla está vacía.
+- `handlers.go`: lista propiedades, consulta disponibilidad y crea o limpia reservas de prueba.
+- `metrics.go`: define las métricas Prometheus y el resumen de `/api/stats`.
+- `src/app/`: páginas, estilos y rutas del frontend.
+- `src/components/clarity-tracker.tsx`: inicia Clarity con el ID configurado.
+- `grafana/`: dashboard listo para importar en Grafana.
